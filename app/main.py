@@ -9,6 +9,9 @@ import joblib
 
 app = FastAPI()
 
+@app.get("/version")
+def get_version():
+    return {"version": "2.0"}
 
 # --------------------------------------------------
 # 2. Load the trained ML model
