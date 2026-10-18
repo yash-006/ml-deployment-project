@@ -1,4 +1,5 @@
-name: Build and Push ML API to ECR
+
+name: Build and Deploy ML API
 
 on:
   push:
@@ -12,9 +13,10 @@ permissions:
 env:
   AWS_REGION: eu-north-1
   ECR_REPOSITORY: ml-deployment-api
+  EC2_INSTANCE_ID: i-094f41e6902afb677
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -31,11 +33,78 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      - name: Build and push Docker image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+
+          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+                     "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Deploy image to EC2 through SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ML API commit $GITHUB_SHA" \
+            --parameters "$(jq -n --arg image "$IMAGE" --arg region "$AWS_REGION" '{
+              commands: [
+                "set -e",
+                ("aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + ($image | split("/")[0])),
+                ("docker pull " + $image),
+                "docker stop ml-api || true",
+                "docker rm ml-api || true",
+                ("docker run -d --name ml-api --restart unless-stopped -p 8000:8000 --log-driver=awslogs --log-opt awslogs-region=" + $region + " --log-opt awslogs-group=/ml-deployment/fastapi --log-opt awslogs-stream=ml-api-deploy --log-opt awslogs-create-group=false " + $image)
+              ]
+            }')" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          for attempt in $(seq 1 36); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            case "$STATUS" in
+              Success)
+                echo "Deployment command succeeded."
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSM command. Check Systems Manager Run Command."
+          exit 1
