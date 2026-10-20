@@ -13,6 +13,10 @@ app = FastAPI()
 def get_version():
     return {"version": "2.0"}
 
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
 # --------------------------------------------------
 # 2. Load the trained ML model
 # --------------------------------------------------
