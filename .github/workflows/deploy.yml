@@ -18,6 +18,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -37,14 +38,17 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" .
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          set -euo pipefail
 
-          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
-                     "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+          docker tag "$IMAGE" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-      - name: Deploy image to EC2 through SSM
+      - name: Deploy and verify health through SSM
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         shell: bash
@@ -53,27 +57,128 @@ jobs:
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
 
+          DEPLOY_SCRIPT=$(cat <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          IMAGE="__IMAGE__"
+          REGION="__REGION__"
+          REGISTRY="__REGISTRY__"
+
+          DEPLOYMENT_STARTED=0
+          OLD_IMAGE=""
+
+          rollback() {
+            RC=$?
+            trap - ERR
+            set +e
+
+            echo "Deployment failed. Attempting rollback..."
+
+            if [ "$DEPLOYMENT_STARTED" = "1" ] && [ -n "$OLD_IMAGE" ]; then
+              docker stop ml-api >/dev/null 2>&1 || true
+              docker rm ml-api >/dev/null 2>&1 || true
+
+              if docker run -d \
+                --name ml-api \
+                --restart unless-stopped \
+                -p 8000:8000 \
+                --log-driver=awslogs \
+                --log-opt "awslogs-region=$REGION" \
+                --log-opt "awslogs-group=/ml-deployment/fastapi" \
+                --log-opt "awslogs-stream=ml-api-deploy" \
+                --log-opt awslogs-create-group=false \
+                "$OLD_IMAGE"; then
+
+                for i in $(seq 1 12); do
+                  if curl -fsS --max-time 3 \
+                    http://localhost:8000/health >/dev/null; then
+                    echo "Rollback successful: previous image is healthy."
+                    exit "$RC"
+                  fi
+                  sleep 5
+                done
+
+                echo "WARNING: Previous container started but did not become healthy."
+              else
+                echo "ERROR: Could not restart the previous image."
+              fi
+            else
+              echo "No previous running image was available for automatic rollback."
+            fi
+
+            exit "$RC"
+          }
+
+          trap rollback ERR
+
+          OLD_IMAGE=$(docker inspect \
+            --format '{{.Config.Image}}' ml-api)
+
+          echo "Previous image: $OLD_IMAGE"
+          echo "New image: $IMAGE"
+
+          aws ecr get-login-password --region "$REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
+          docker pull "$IMAGE"
+
+          docker stop ml-api
+          docker rm ml-api
+          DEPLOYMENT_STARTED=1
+
+          docker run -d \
+            --name ml-api \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            --log-driver=awslogs \
+            --log-opt "awslogs-region=$REGION" \
+            --log-opt "awslogs-group=/ml-deployment/fastapi" \
+            --log-opt "awslogs-stream=ml-api-deploy" \
+            --log-opt awslogs-create-group=false \
+            "$IMAGE"
+
+          echo "Waiting for the new API to become healthy..."
+
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 3 \
+              http://localhost:8000/health >/dev/null; then
+              echo "Health check passed."
+              docker ps --filter name=ml-api
+              docker inspect --format \
+                'Running image: {{.Config.Image}}' ml-api
+              DEPLOYMENT_STARTED=0
+              trap - ERR
+              exit 0
+            fi
+
+            echo "Health check attempt $i/12 failed."
+            sleep 5
+          done
+
+          echo "ERROR: New container did not become healthy."
+          false
+          REMOTE_SCRIPT
+          )
+
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE__/$IMAGE}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__REGION__/$AWS_REGION}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__REGISTRY__/$ECR_REGISTRY}"
+
+          PARAMETERS=$(jq -n --arg script "$DEPLOY_SCRIPT" \
+            '{commands: [$script]}')
+
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy ML API commit $GITHUB_SHA" \
-            --parameters "$(jq -n --arg image "$IMAGE" --arg region "$AWS_REGION" '{
-              commands: [
-                "set -e",
-                ("aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + ($image | split("/")[0])),
-                ("docker pull " + $image),
-                "docker stop ml-api || true",
-                "docker rm ml-api || true",
-                ("docker run -d --name ml-api --restart unless-stopped -p 8000:8000 --log-driver=awslogs --log-opt awslogs-region=" + $region + " --log-opt awslogs-group=/ml-deployment/fastapi --log-opt awslogs-stream=ml-api-deploy --log-opt awslogs-create-group=false " + $image)
-              ]
-            }')" \
+            --comment "Health-checked deployment $GITHUB_SHA" \
+            --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
 
           echo "SSM command ID: $COMMAND_ID"
 
-          for attempt in $(seq 1 36); do
+          for attempt in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation \
               --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
@@ -83,7 +188,7 @@ jobs:
 
             case "$STATUS" in
               Success)
-                echo "Deployment command succeeded."
+                echo "Deployment and health check succeeded."
                 aws ssm get-command-invocation \
                   --region "$AWS_REGION" \
                   --command-id "$COMMAND_ID" \
@@ -106,5 +211,5 @@ jobs:
             sleep 5
           done
 
-          echo "Timed out waiting for SSM command. Check Systems Manager Run Command."
+          echo "Timed out waiting for SSM. Check Systems Manager Run Command."
           exit 1
